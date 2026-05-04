@@ -1,0 +1,825 @@
+name: GPTrive Apply
+
+on:
+  push:
+    paths:
+      - ".gptrive/patches/*.ready.json"
+
+permissions:
+  contents: write
+  actions: read
+  pull-requests: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout trigger commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 1
+
+      - name: Resolve ready marker
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          changed_files="$(git show --name-only --pretty='' "$GITHUB_SHA" -- .gptrive/patches || true)"
+          ready_path="$(printf '%s\n' "$changed_files" | grep -E '^\.gptrive/patches/.*\.ready\.json$' | tail -n1 || true)"
+
+          if [ -z "$ready_path" ]; then
+            ready_path="$(find .gptrive/patches -maxdepth 1 -type f -name '*.ready.json' | sort | tail -n1 || true)"
+          fi
+
+          if [ -z "$ready_path" ]; then
+            echo "No ready marker found."
+            exit 1
+          fi
+
+          echo "ready_path=${ready_path}" >> "$GITHUB_OUTPUT"
+
+      - name: Read ready marker
+        id: ready
+        env:
+          READY_PATH: ${{ steps.resolve.outputs.ready_path }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+
+          const readyPath = process.env.READY_PATH;
+          const outputPath = process.env.GITHUB_OUTPUT;
+          const ready = JSON.parse(fs.readFileSync(readyPath, "utf8"));
+
+          function assertPatchPath(value, label) {
+            if (!value || typeof value !== "string") {
+              throw new Error(`${label} missing.`);
+            }
+
+            const normalized = value.replace(/\\/g, "/");
+
+            if (!normalized.startsWith(".gptrive/patches/")) {
+              throw new Error(`${label} must stay inside .gptrive/patches/: ${value}`);
+            }
+
+            if (normalized.includes("..") || normalized.includes("/.git") || normalized.startsWith("/")) {
+              throw new Error(`${label} unsafe: ${value}`);
+            }
+
+            return normalized;
+          }
+
+          if (!ready.id || typeof ready.id !== "string") {
+            throw new Error("ready.json missing id");
+          }
+
+          const zipPath = assertPatchPath(ready.zipPath, "zipPath");
+          const metaPath = assertPatchPath(ready.metaPath, "metaPath");
+          const normalizedReadyPath = assertPatchPath(readyPath, "readyPath");
+
+          if (!fs.existsSync(zipPath)) {
+            throw new Error(`zip file missing: ${zipPath}`);
+          }
+
+          if (!fs.existsSync(metaPath)) {
+            throw new Error(`meta file missing: ${metaPath}`);
+          }
+
+          fs.appendFileSync(
+            outputPath,
+            [
+              `patch_id=${ready.id}`,
+              `zip_path=${zipPath}`,
+              `meta_path=${metaPath}`,
+              `ready_path=${normalizedReadyPath}`
+            ].join("\n") + "\n"
+          );
+          NODE
+
+      - name: Read patch metadata
+        id: meta
+        env:
+          META_PATH: ${{ steps.ready.outputs.meta_path }}
+          PATCH_ID: ${{ steps.ready.outputs.patch_id }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+
+          const metaPath = process.env.META_PATH;
+          const patchId = process.env.PATCH_ID;
+          const outputPath = process.env.GITHUB_OUTPUT;
+          const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+          const applyMode = meta.applyMode;
+          const targetBranch = meta.targetBranch;
+
+          if (!["direct-branch", "direct-main", "pr"].includes(applyMode)) {
+            throw new Error(`Unsupported applyMode: ${applyMode}`);
+          }
+
+          if (!targetBranch || typeof targetBranch !== "string") {
+            throw new Error("targetBranch missing in meta.json");
+          }
+
+          const prBranch = applyMode === "pr"
+            ? (typeof meta.prBranch === "string" && meta.prBranch ? meta.prBranch : `gptrive/${patchId}`)
+            : "";
+          const checkoutBranch = applyMode === "direct-main"
+            ? "main"
+            : (applyMode === "pr" ? prBranch : targetBranch);
+
+          fs.appendFileSync(
+            outputPath,
+            [
+              `apply_mode=${applyMode}`,
+              `target_branch=${targetBranch}`,
+              `checkout_branch=${checkoutBranch}`,
+              `pr_branch=${prBranch}`
+            ].join("\n") + "\n"
+          );
+          NODE
+
+      - name: Validate branch protocol
+        env:
+          EVENT_BRANCH: ${{ github.ref_name }}
+          APPLY_MODE: ${{ steps.meta.outputs.apply_mode }}
+          TARGET_BRANCH: ${{ steps.meta.outputs.target_branch }}
+          CHECKOUT_BRANCH: ${{ steps.meta.outputs.checkout_branch }}
+          PR_BRANCH: ${{ steps.meta.outputs.pr_branch }}
+        run: |
+          set -euo pipefail
+
+          if [ "$CHECKOUT_BRANCH" != "$EVENT_BRANCH" ]; then
+            echo "Push branch: $EVENT_BRANCH"
+            echo "Expected branch: $CHECKOUT_BRANCH"
+            exit 1
+          fi
+
+          if [ "$APPLY_MODE" = "direct-main" ] && [ "$EVENT_BRANCH" != "main" ]; then
+            echo "direct-main must upload on main."
+            exit 1
+          fi
+
+          if [ "$APPLY_MODE" = "direct-branch" ] && [ "$TARGET_BRANCH" != "$EVENT_BRANCH" ]; then
+            echo "direct-branch must upload on targetBranch."
+            exit 1
+          fi
+
+          if [ "$APPLY_MODE" = "pr" ]; then
+            if [ -z "$PR_BRANCH" ]; then
+              echo "pr mode requires prBranch."
+              exit 1
+            fi
+
+            if [ "$EVENT_BRANCH" != "$PR_BRANCH" ]; then
+              echo "pr mode must trigger on prBranch."
+              echo "Push branch: $EVENT_BRANCH"
+              echo "Expected PR branch: $PR_BRANCH"
+              exit 1
+            fi
+          fi
+
+      - name: Prepare apply branch
+        env:
+          CHECKOUT_BRANCH: ${{ steps.meta.outputs.checkout_branch }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$CHECKOUT_BRANCH" --depth=1
+          git checkout -B "$CHECKOUT_BRANCH" "origin/$CHECKOUT_BRANCH"
+
+      - name: Log workflow branch state
+        env:
+          EVENT_BRANCH: ${{ github.ref_name }}
+          TARGET_BRANCH: ${{ steps.meta.outputs.target_branch }}
+          APPLY_MODE: ${{ steps.meta.outputs.apply_mode }}
+          PR_BRANCH: ${{ steps.meta.outputs.pr_branch }}
+        run: |
+          set -euo pipefail
+          echo "github.ref_name=$EVENT_BRANCH"
+          echo "targetBranch=$TARGET_BRANCH"
+          echo "applyMode=$APPLY_MODE"
+          echo "prBranch=${PR_BRANCH:-}"
+          echo "current git branch=$(git branch --show-current)"
+          echo "current git sha=$(git rev-parse HEAD)"
+
+      - name: Initialize runtime workspace
+        run: |
+          set -euo pipefail
+          mkdir -p .gptrive/runtime/logs
+          : > .gptrive/runtime/changed-files.txt
+          : > .gptrive/runtime/deleted-files.txt
+
+      - name: Stage patch files
+        env:
+          ZIP_PATH: ${{ steps.ready.outputs.zip_path }}
+          META_PATH: ${{ steps.ready.outputs.meta_path }}
+          READY_PATH: ${{ steps.ready.outputs.ready_path }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gptrive-patch"
+          cp "$ZIP_PATH" "$RUNNER_TEMP/gptrive-patch/patch.zip"
+          cp "$META_PATH" "$RUNNER_TEMP/gptrive-patch/meta.json"
+          cp "$READY_PATH" "$RUNNER_TEMP/gptrive-patch/ready.json"
+
+      - name: Validate zip entry paths
+        run: |
+          set -euo pipefail
+          unzip -Z1 "$RUNNER_TEMP/gptrive-patch/patch.zip" > "$RUNNER_TEMP/gptrive-patch/entries.txt"
+          node <<'NODE'
+          const fs = require("fs");
+
+          const entries = fs
+            .readFileSync(`${process.env.RUNNER_TEMP}/gptrive-patch/entries.txt`, "utf8")
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean);
+
+          function assertSafeArchivePath(entry) {
+            if (entry.startsWith("/") || /^[A-Za-z]:[\\/]/.test(entry)) {
+              throw new Error(`Absolute path not allowed: ${entry}`);
+            }
+
+            const segments = entry.split("/").filter(Boolean);
+
+            if (segments.includes("..")) {
+              throw new Error(`Parent traversal not allowed: ${entry}`);
+            }
+
+            if (segments.includes(".git")) {
+              throw new Error(`.git path not allowed: ${entry}`);
+            }
+          }
+
+          for (const entry of entries) {
+            assertSafeArchivePath(entry);
+          }
+          NODE
+
+      - name: Extract patch
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gptrive-extract"
+          unzip -q "$RUNNER_TEMP/gptrive-patch/patch.zip" -d "$RUNNER_TEMP/gptrive-extract"
+
+      - name: Read gptrive manifest
+        id: patch_manifest
+        env:
+          EXTRACT_ROOT: ${{ runner.temp }}/gptrive-extract
+          PATCH_ID: ${{ steps.ready.outputs.patch_id }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+
+          const outputPath = process.env.GITHUB_OUTPUT;
+          const manifestPath = path.join(process.env.EXTRACT_ROOT, "gptrive.json");
+          let title = process.env.PATCH_ID;
+          let description = "";
+
+          if (fs.existsSync(manifestPath)) {
+            try {
+              const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+              if (typeof manifest.title === "string" && manifest.title.trim()) {
+                title = manifest.title.trim();
+              }
+              if (typeof manifest.description === "string" && manifest.description.trim()) {
+                description = manifest.description.trim();
+              }
+            } catch (error) {
+              // Best effort only. Keep defaults if gptrive.json is malformed.
+            }
+          }
+
+          fs.appendFileSync(outputPath, `pr_title<<__GPTRIVE__\nGPTrive: ${title}\n__GPTRIVE__\n`);
+          fs.appendFileSync(outputPath, `pr_description<<__GPTRIVE__\n${description}\n__GPTRIVE__\n`);
+          NODE
+
+      - name: Apply files and deletes
+        env:
+          EXTRACT_ROOT: ${{ runner.temp }}/gptrive-extract
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+
+          const repoRoot = process.cwd();
+          const extractRoot = process.env.EXTRACT_ROOT;
+          const filesRoot = path.join(extractRoot, "files");
+          const deletesPath = path.join(extractRoot, "deletes.txt");
+          const runtimeRoot = path.join(repoRoot, ".gptrive", "runtime");
+          const changedFilesPath = path.join(runtimeRoot, "changed-files.txt");
+          const deletedFilesPath = path.join(runtimeRoot, "deleted-files.txt");
+          const changedFiles = [];
+          const deletedFiles = [];
+
+          function assertSafeRelativePath(relativePath) {
+            if (!relativePath || typeof relativePath !== "string") {
+              throw new Error("Path empty.");
+            }
+
+            if (path.isAbsolute(relativePath) || /^[A-Za-z]:[\\/]/.test(relativePath)) {
+              throw new Error(`Absolute path not allowed: ${relativePath}`);
+            }
+
+            const normalized = relativePath.replace(/\\/g, "/");
+            const segments = normalized.split("/").filter(Boolean);
+
+            if (!segments.length) {
+              throw new Error("Path empty after normalization.");
+            }
+
+            if (segments.includes("..")) {
+              throw new Error(`Parent traversal not allowed: ${relativePath}`);
+            }
+
+            if (segments.includes(".git")) {
+              throw new Error(`.git path not allowed: ${relativePath}`);
+            }
+
+            return segments.join("/");
+          }
+
+          function walkFiles(dir) {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            const files = [];
+
+            for (const entry of entries) {
+              const fullPath = path.join(dir, entry.name);
+              if (entry.isDirectory()) {
+                files.push(...walkFiles(fullPath));
+              } else if (entry.isFile()) {
+                files.push(fullPath);
+              }
+            }
+
+            return files;
+          }
+
+          if (fs.existsSync(filesRoot)) {
+            for (const sourcePath of walkFiles(filesRoot)) {
+              const relativePath = assertSafeRelativePath(path.relative(filesRoot, sourcePath));
+              const destinationPath = path.join(repoRoot, relativePath);
+              fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+              fs.copyFileSync(sourcePath, destinationPath);
+              changedFiles.push(relativePath);
+            }
+          }
+
+          if (fs.existsSync(deletesPath)) {
+            const deleteLines = fs
+              .readFileSync(deletesPath, "utf8")
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+
+            for (const deleteLine of deleteLines) {
+              const relativePath = assertSafeRelativePath(deleteLine);
+              const targetPath = path.join(repoRoot, relativePath);
+              fs.rmSync(targetPath, { recursive: true, force: true });
+              deletedFiles.push(relativePath);
+            }
+          }
+
+          fs.writeFileSync(changedFilesPath, changedFiles.join("\n"));
+          fs.writeFileSync(deletedFilesPath, deletedFiles.join("\n"));
+          NODE
+
+      - name: Run Node checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUNTIME_DIR=".gptrive/runtime"
+          LOG_DIR="$RUNTIME_DIR/logs"
+          mkdir -p "$LOG_DIR"
+
+          summarize_log() {
+            python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); lines=p.read_text(errors="replace").splitlines() if p.exists() else []; tail=[line.strip() for line in lines[-80:] if line.strip()]; patterns=("intentional test failure","npm ERR!","error:","Error:","failed","FAILED"); primary=next((line for line in tail if any(pattern in line for pattern in patterns) and not line.startswith("> ")), ""); secondary=next((line for line in tail if any(pattern in line for pattern in patterns)), ""); fallback=next((line for line in reversed(tail) if line), "No output captured." if p.exists() else "No log captured."); print(primary or secondary or fallback)' "$1"
+          }
+
+          record_skip() {
+            local name="$1"
+            local reason="$2"
+            printf '%s\n' "$reason" > "$LOG_DIR/$name.log"
+            printf 'SKIPPED\n' > "$RUNTIME_DIR/$name.exit_code.txt"
+            printf '%s\n' "$reason" > "$RUNTIME_DIR/$name.summary.txt"
+            : > "$RUNTIME_DIR/$name.tail.txt"
+          }
+
+          run_check() {
+            local name="$1"
+            shift
+            local cmd="$*"
+            local log_path="$LOG_DIR/$name.log"
+            local exit_code
+            local summary
+
+            printf '%s\n' "$cmd" > "$RUNTIME_DIR/$name.command.txt"
+
+            set +e
+            bash -lc "$cmd" >"$log_path" 2>&1
+            exit_code=$?
+            set -e
+
+            printf '%s\n' "$exit_code" > "$RUNTIME_DIR/$name.exit_code.txt"
+            tail -n 80 "$log_path" > "$RUNTIME_DIR/$name.tail.txt" || true
+            summary="$(summarize_log "$log_path")"
+            printf '%s\n' "$summary" > "$RUNTIME_DIR/$name.summary.txt"
+
+            if [ "$exit_code" -ne 0 ]; then
+              printf '%s\n' "$name" > "$RUNTIME_DIR/failed-check.txt"
+              printf '%s\n' "$cmd" > "$RUNTIME_DIR/failed-command.txt"
+              printf '%s\n' "$exit_code" > "$RUNTIME_DIR/failed-exit-code.txt"
+              printf '%s\n' "$summary" > "$RUNTIME_DIR/error-summary.txt"
+              cp "$RUNTIME_DIR/$name.tail.txt" "$RUNTIME_DIR/failed-output-tail.txt"
+              return "$exit_code"
+            fi
+          }
+
+          if [ -f package-lock.json ]; then
+            run_check install "npm ci"
+          elif [ -f package.json ]; then
+            run_check install "npm install"
+          else
+            record_skip install "Skipped install: no package.json or package-lock.json."
+          fi
+
+          if [ -f package.json ]; then
+            run_check test "npm test --if-present"
+            run_check build "npm run build --if-present"
+            run_check lint "npm run lint --if-present"
+          else
+            record_skip test "Skipped test: no package.json."
+            record_skip build "Skipped build: no package.json."
+            record_skip lint "Skipped lint: no package.json."
+          fi
+
+      - name: Snapshot apply summary files
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gptrive-summary"
+          rm -rf "$RUNNER_TEMP/gptrive-runtime"
+          cp .gptrive/runtime/changed-files.txt "$RUNNER_TEMP/gptrive-summary/changed-files.txt"
+          cp .gptrive/runtime/deleted-files.txt "$RUNNER_TEMP/gptrive-summary/deleted-files.txt"
+          cp -R .gptrive/runtime "$RUNNER_TEMP/gptrive-runtime"
+
+      - name: Cleanup patch files after successful apply
+        env:
+          ZIP_PATH: ${{ steps.ready.outputs.zip_path }}
+          META_PATH: ${{ steps.ready.outputs.meta_path }}
+          READY_PATH: ${{ steps.ready.outputs.ready_path }}
+        run: |
+          set -euo pipefail
+          rm -f "$ZIP_PATH" "$META_PATH" "$READY_PATH"
+
+      - name: Commit and push
+        id: commit_push
+        env:
+          PATCH_ID: ${{ steps.ready.outputs.patch_id }}
+          CHECKOUT_BRANCH: ${{ steps.meta.outputs.checkout_branch }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "gptrive[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No repo changes after apply."
+            echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          rm -rf .gptrive/runtime
+          git add -A
+          git commit -m "chore(gptrive): apply patch ${PATCH_ID}"
+          git push origin "HEAD:${CHECKOUT_BRANCH}"
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create or reuse pull request
+        id: pr
+        if: ${{ success() && steps.meta.outputs.apply_mode == 'pr' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          APPLY_MODE: ${{ steps.meta.outputs.apply_mode }}
+          PATCH_ID: ${{ steps.ready.outputs.patch_id }}
+          TARGET_BRANCH: ${{ steps.meta.outputs.target_branch }}
+          PR_BRANCH: ${{ steps.meta.outputs.pr_branch }}
+          PR_TITLE: ${{ steps.patch_manifest.outputs.pr_title }}
+          PR_DESCRIPTION: ${{ steps.patch_manifest.outputs.pr_description }}
+          RUNTIME_SNAPSHOT_DIR: ${{ runner.temp }}/gptrive-runtime
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+
+          async function main() {
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+            const apiBase = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+            const changedFiles = fs
+              .readFileSync(`${process.env.RUNNER_TEMP}/gptrive-summary/changed-files.txt`, "utf8")
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+            const deletedFiles = fs
+              .readFileSync(`${process.env.RUNNER_TEMP}/gptrive-summary/deleted-files.txt`, "utf8")
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+
+            async function github(method, path, body) {
+              const response = await fetch(`${apiBase}${path}`, {
+                method,
+                headers: {
+                  Accept: "application/vnd.github+json",
+                  Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2022-11-28"
+                },
+                body: body ? JSON.stringify(body) : undefined
+              });
+
+              const text = await response.text();
+              const data = text ? JSON.parse(text) : null;
+
+              if (!response.ok) {
+                throw new Error(data?.message || `${method} ${path} failed with ${response.status}`);
+              }
+
+              return data;
+            }
+
+            function recordFailure(message) {
+              fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-check.txt`, "pr");
+              fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-command.txt`, "create pull request");
+              fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-exit-code.txt`, "1");
+              fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/error-summary.txt`, message);
+              fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-output-tail.txt`, message);
+            }
+
+            function renderList(lines) {
+              return lines.length ? lines.map((line) => `- ${line}`).join("\n") : "- none";
+            }
+
+            function buildBody() {
+              const parts = [
+                "## GPTrive Patch",
+                "",
+                `Patch ID: \`${process.env.PATCH_ID}\``,
+                "",
+                `Target branch: \`${process.env.TARGET_BRANCH}\``,
+                "",
+                "Apply mode: `pr`"
+              ];
+
+              if ((process.env.PR_DESCRIPTION || "").trim()) {
+                parts.push("", "## Summary", "", process.env.PR_DESCRIPTION.trim());
+              }
+
+              parts.push(
+                "",
+                "## Changed files",
+                "",
+                renderList(changedFiles),
+                "",
+                "## Deleted files",
+                "",
+                renderList(deletedFiles),
+                "",
+                "## Checks",
+                "",
+                "GitHub Actions checks passed before this PR was created.",
+                "",
+                "## Next step",
+                "",
+                "Review this PR and merge it in GitHub if the changes look correct."
+              );
+
+              return parts.join("\n");
+            }
+
+            const outputPath = process.env.GITHUB_OUTPUT;
+
+            try {
+              const query = new URLSearchParams({
+                state: "open",
+                head: `${owner}:${process.env.PR_BRANCH}`,
+                base: process.env.TARGET_BRANCH,
+                per_page: "20"
+              });
+              const existing = await github("GET", `/pulls?${query.toString()}`);
+
+              if (Array.isArray(existing) && existing.length) {
+                const pr = existing[0];
+                fs.appendFileSync(
+                  outputPath,
+                  [
+                    `pr_url=${pr.html_url || ""}`,
+                    `pr_number=${pr.number || ""}`,
+                    "pr_status=existing"
+                  ].join("\n") + "\n"
+                );
+                return;
+              }
+
+              const created = await github("POST", "/pulls", {
+                title: process.env.PR_TITLE || `GPTrive: ${process.env.PATCH_ID}`,
+                body: buildBody(),
+                head: process.env.PR_BRANCH,
+                base: process.env.TARGET_BRANCH
+              });
+
+              fs.appendFileSync(
+                outputPath,
+                [
+                  `pr_url=${created.html_url || ""}`,
+                  `pr_number=${created.number || ""}`,
+                  "pr_status=created"
+                ].join("\n") + "\n"
+              );
+            } catch (error) {
+              recordFailure(String(error.message || error));
+              throw error;
+            }
+          }
+
+          main().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Write success summary
+        if: success()
+        env:
+          PATCH_ID: ${{ steps.ready.outputs.patch_id }}
+          APPLY_MODE: ${{ steps.meta.outputs.apply_mode }}
+          TARGET_BRANCH: ${{ steps.meta.outputs.target_branch }}
+          PR_URL: ${{ steps.pr.outputs.pr_url }}
+          PR_STATUS: ${{ steps.pr.outputs.pr_status }}
+          COMMIT_SHA: ${{ steps.commit_push.outputs.commit_sha }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+
+          function readList(relativeName) {
+            const fullPath = `${process.env.RUNNER_TEMP}/gptrive-summary/${relativeName}`;
+            if (!fs.existsSync(fullPath)) {
+              return [];
+            }
+            return fs
+              .readFileSync(fullPath, "utf8")
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+          }
+
+          const changedFiles = readList("changed-files.txt");
+          const deletedFiles = readList("deleted-files.txt");
+          const lines = [
+            "## GPTrive Success",
+            "",
+            `- Patch ID: ${process.env.PATCH_ID || "unknown"}`,
+            `- Apply Mode: ${process.env.APPLY_MODE || "unknown"}`,
+            `- Target Branch: ${process.env.TARGET_BRANCH || "unknown"}`,
+            "- Changed Files:",
+            ...(changedFiles.length ? changedFiles.map((line) => `  - ${line}`) : ["  - none"]),
+            "- Deleted Files:",
+            ...(deletedFiles.length ? deletedFiles.map((line) => `  - ${line}`) : ["  - none"])
+          ];
+
+          if ((process.env.APPLY_MODE || "") === "pr" && process.env.PR_URL) {
+            lines.push(
+              process.env.PR_STATUS === "existing"
+                ? `- PR already exists: ${process.env.PR_URL}`
+                : `- PR created: ${process.env.PR_URL}`
+            );
+          }
+
+          lines.push(
+            `- Commit SHA: ${process.env.COMMIT_SHA || "unknown"}`,
+            "- Cleanup Status: removed patch bundle files before commit"
+          );
+
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${lines.join("\n")}\n`);
+          NODE
+
+      - name: Write error report
+        if: failure()
+        env:
+          PATCH_ID: ${{ steps.ready.outputs.patch_id }}
+          READY_PATH: ${{ steps.ready.outputs.ready_path }}
+          ZIP_PATH: ${{ steps.ready.outputs.zip_path }}
+          META_PATH: ${{ steps.ready.outputs.meta_path }}
+          APPLY_MODE: ${{ steps.meta.outputs.apply_mode }}
+          TARGET_BRANCH: ${{ steps.meta.outputs.target_branch }}
+          CHECKOUT_BRANCH: ${{ steps.meta.outputs.checkout_branch }}
+          PR_BRANCH: ${{ steps.meta.outputs.pr_branch }}
+          RESOLVE_STATUS: ${{ steps.resolve.conclusion }}
+          READY_STATUS: ${{ steps.ready.conclusion }}
+          META_STATUS: ${{ steps.meta.conclusion }}
+          PR_STATUS: ${{ steps.pr.conclusion }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+
+          const runtimeDir = fs.existsSync(path.join(process.cwd(), ".gptrive", "runtime"))
+            ? path.join(process.cwd(), ".gptrive", "runtime")
+            : `${process.env.RUNNER_TEMP}/gptrive-runtime`;
+          const runUrl = `https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+          const artifactName = `gptrive-error-report-${process.env.GITHUB_RUN_ID}`;
+
+          function readOptional(relativePath, fallback = "unknown") {
+            const fullPath = path.join(runtimeDir, relativePath);
+            if (!fs.existsSync(fullPath)) {
+              return fallback;
+            }
+            const value = fs.readFileSync(fullPath, "utf8").trim();
+            return value || fallback;
+          }
+
+          function readList(relativePath) {
+            const fullPath = path.join(runtimeDir, relativePath);
+            if (!fs.existsSync(fullPath)) {
+              return [];
+            }
+            return fs
+              .readFileSync(fullPath, "utf8")
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+          }
+
+          const changedFiles = readList("changed-files.txt");
+          const deletedFiles = readList("deleted-files.txt");
+          const failedCommand = readOptional("failed-command.txt");
+          const failedExitCode = readOptional("failed-exit-code.txt");
+          const errorSummary = readOptional("error-summary.txt");
+          const rawOutputTail = readOptional("failed-output-tail.txt", "No output tail captured.");
+
+          const report = [
+            "# GPTrive Error Report",
+            "",
+            `- Patch ID: ${process.env.PATCH_ID || "unknown"}`,
+            `- Apply Mode: ${process.env.APPLY_MODE || "unknown"}`,
+            `- Target Branch: ${process.env.TARGET_BRANCH || "unknown"}`,
+            `- PR Branch: ${process.env.PR_BRANCH || "unknown"}`,
+            `- Zip Path: ${process.env.ZIP_PATH || "unknown"}`,
+            `- Meta Path: ${process.env.META_PATH || "unknown"}`,
+            `- Ready Path: ${process.env.READY_PATH || "unknown"}`,
+            `- Trigger Ref: ${process.env.GITHUB_REF || "unknown"}`,
+            `- Trigger SHA: ${process.env.GITHUB_SHA || "unknown"}`,
+            `- Checkout Branch: ${process.env.CHECKOUT_BRANCH || "unknown"}`,
+            `- Resolve Step: ${process.env.RESOLVE_STATUS || "unknown"}`,
+            `- Ready Step: ${process.env.READY_STATUS || "unknown"}`,
+            `- Meta Step: ${process.env.META_STATUS || "unknown"}`,
+            `- PR Step: ${process.env.PR_STATUS || "not-run"}`,
+            `- Failed Command: ${failedCommand}`,
+            `- Exit Code: ${failedExitCode}`,
+            `- Error Summary: ${errorSummary}`,
+            `- Workflow Run URL: ${runUrl}`,
+            "",
+            "## Changed Files",
+            changedFiles.length ? changedFiles.map((line) => `- ${line}`).join("\n") : "- none",
+            "",
+            "## Deleted Files",
+            deletedFiles.length ? deletedFiles.map((line) => `- ${line}`).join("\n") : "- none",
+            "",
+            "## Raw Output Tail",
+            "```text",
+            rawOutputTail,
+            "```",
+            "",
+            "## Request for ChatGPT",
+            "请基于以上 GPTrive error-report 修复项目，并重新生成 gptrive.zip。zip 格式仍然是：",
+            "- gptrive.json",
+            "- files/",
+            "- deletes.txt",
+            ""
+          ].join("\n");
+
+          fs.writeFileSync("error-report.md", report);
+
+          const summary = [
+            "## GPTrive Failure",
+            "",
+            `- Patch ID: ${process.env.PATCH_ID || "unknown"}`,
+            `- Apply Mode: ${process.env.APPLY_MODE || "unknown"}`,
+            `- Target Branch: ${process.env.TARGET_BRANCH || "unknown"}`,
+            `- PR Branch: ${process.env.PR_BRANCH || "unknown"}`,
+            "- Changed Files:",
+            ...(changedFiles.length ? changedFiles.map((line) => `  - ${line}`) : ["  - none"]),
+            `- Failed Command: ${failedCommand}`,
+            `- Error Summary: ${errorSummary}`,
+            `- Artifact Name: ${artifactName}`,
+            ""
+          ].join("\n");
+
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary}\n`);
+          NODE
+
+      - name: Upload error report artifact
+        if: ${{ always() && hashFiles('error-report.md') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gptrive-error-report-${{ github.run_id }}
+          path: error-report.md
